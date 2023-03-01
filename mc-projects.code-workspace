@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "./esp32-rotary-encoder"
+		},
+		{
+			"path": "./esp8266-dht22"
+		},
+		{
+			"path": "./pico-start"
+		},
+	],
+	"settings": {}
+}
