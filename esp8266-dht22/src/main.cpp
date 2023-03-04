@@ -7,6 +7,7 @@
 // - DHT Sensor Library: https://github.com/adafruit/DHT-sensor-library
 // - Adafruit Unified Sensor Lib: https://github.com/adafruit/Adafruit_Sensor
 
+#include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <Adafruit_Sensor.h>
@@ -55,8 +56,6 @@ DHT_Unified dht(DHTPIN, DHTTYPE);
 DHT_Unified dht2(DHTPIN2, DHTTYPE);
 DHT_Unified dht3(DHTPIN3, DHTTYPE);
 DHT_Unified dht4(DHTPIN4, DHTTYPE);
-
-uint32_t delayMS;
 
 void setup_wifi() {
   // WIFI connection
@@ -195,18 +194,6 @@ float getValue(DHT_Unified sensor) {
     Serial.print(event.temperature);
     Serial.println(F("°C"));
   }
-  // Get humidity event and print its value.
-  // sensor.humidity().getEvent(&event);
-  // if (isnan(event.relative_humidity)) {
-  //   Serial.println(F("Error reading humidity!"));
-  // }
-  // else {
-  //   humd = event.relative_humidity;
-  //   hasValue = true;
-  //   Serial.print(F("Humidity: "));
-  //   Serial.print(event.relative_humidity);
-  //   Serial.println(F("%"));
-  // }
   return temp;
 }
 
