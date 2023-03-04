@@ -9,6 +9,14 @@
 		{
 			"path": "./pico-start"
 		},
+		{
+			"name": "esp8266-co2",
+			"path": "esp8266-co2"
+		},
+		{
+			"name": "esp8266-temp-sensor",
+			"path": "esp8266-temp-sensor"
+		}
 	],
 	"settings": {}
 }
