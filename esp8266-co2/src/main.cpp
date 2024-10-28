@@ -15,6 +15,8 @@
 #define TX_PIN 12      // Tx pin which the MHZ19 Rx pin is attached to
 #define BAUDRATE 9600 // Device to MH-Z19 Serial baudrate (should not be changed)
 
+#define MH_CALIBRATION_PIN 4
+
 bool configSend = 0;
 DHT_Unified dht(DHTPIN, DHTTYPE);
 
@@ -32,6 +34,8 @@ char topicNameCo2Config[] = "homeassistant/sensor/sensorAirQualityCo2/config";
 char topicNameState[] = "homeassistant/sensor/sensorAirQuality/state";
 
 unsigned long getDataTimer = 0;
+
+int lastCo2 = 0;
 
 void setup_wifi()
 {
@@ -115,27 +119,6 @@ void reconnect()
         if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS))
         {
             Serial.println("connected");
-            if (!configSend)
-            {
-                Serial.println();
-                Serial.println("Send MQTT homeassistant config...");
-
-                snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"temperature\", \"name\": \"Temperature\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality/state\", \"unit_of_meas\": \"°C\", \"val_tpl\": \"{{ value_json.temperature}}\", \"uniq_id\": \"dvairqual01-T\" }");
-                Serial.println(msg);
-                mqttClient.publish(topicNameTempConfig, msg);
-
-                snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"humidity\", \"name\": \"Humidity\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality/state\", \"unit_of_meas\": \"%%\", \"val_tpl\": \"{{ value_json.humidity}}\", \"uniq_id\": \"dvairqual01-H\" }");
-                Serial.println(msg);
-                mqttClient.publish(topicNameHumdConfig, msg);
-
-                snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"carbon_dioxide\", \"name\": \"CO2\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality/state\", \"unit_of_meas\": \"ppm\", \"val_tpl\": \"{{ value_json.co2}}\", \"uniq_id\": \"dvairqual01-C\" }");
-                Serial.println(msg);
-                mqttClient.publish(topicNameCo2Config, msg);
-
-                Serial.println();
-
-                configSend = 1;
-            }
         }
         else
         {
@@ -148,11 +131,45 @@ void reconnect()
     }
 }
 
+void send_sonsor_config() {
+    if (!mqttClient.connected())
+    {
+        reconnect();
+    }
+
+    Serial.println();
+    Serial.println("Send MQTT homeassistant config...");
+
+    snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"temperature\", \"name\": \"Temperature\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality/state\", \"unit_of_meas\": \"°C\", \"val_tpl\": \"{{ value_json.temperature}}\", \"uniq_id\": \"dvairqual01-T\" }");
+    Serial.println(msg);
+    mqttClient.publish(topicNameTempConfig, msg);
+
+    snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"humidity\", \"name\": \"Humidity\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality/state\", \"unit_of_meas\": \"%%\", \"val_tpl\": \"{{ value_json.humidity}}\", \"uniq_id\": \"dvairqual01-H\" }");
+    Serial.println(msg);
+    mqttClient.publish(topicNameHumdConfig, msg);
+
+    snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"carbon_dioxide\", \"name\": \"CO2\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality/state\", \"unit_of_meas\": \"ppm\", \"val_tpl\": \"{{ value_json.co2}}\", \"uniq_id\": \"dvairqual01-C\" }");
+    Serial.println(msg);
+    mqttClient.publish(topicNameCo2Config, msg);
+
+    Serial.println();
+    mqttClient.disconnect();
+}
+
 void setup()
 {
     Serial.begin(115200); // Device to serial monitor feedback
 
+    pinMode(MH_CALIBRATION_PIN, INPUT_PULLUP);
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH);
+
     mySerial.begin(BAUDRATE); // (Uno example) device to MH-Z19 serial start
+
+    myMHZ19.begin(mySerial);  // *Serial(Stream) reference must be passed to library begin().
+
+    myMHZ19.autoCalibration(false); // Turn auto calibration ON (OFF autoCalibration(false))
+    Serial.print("ABC Status: "); myMHZ19.getABC() ? Serial.println("ON") :  Serial.println("OFF");
 
     setup_wifi();
 
@@ -162,14 +179,35 @@ void setup()
 
     setup_sensor();
 
-    myMHZ19.begin(mySerial);  // *Serial(Stream) reference must be passed to library begin().
+    delay(200);
 
-    myMHZ19.autoCalibration(false); // Turn auto calibration ON (OFF autoCalibration(false))
+    if (!configSend) {
+        send_sonsor_config();
+        configSend = 1;
+    }
+
+    if (digitalRead(MH_CALIBRATION_PIN) == LOW) {
+
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(2000);
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(500);
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(500);
+        digitalWrite(LED_BUILTIN, HIGH);
+
+        Serial.println("Waiting 20 minutes to stabilize...");
+        /* if you don't need to wait (it's already been this amount of time), remove the 2 lines */
+        delay(12e5);    //  20 minutes in milliseconds
+
+        Serial.println("Calibrating..");
+        myMHZ19.calibrate();    // Take a reading which be used as the zero point for 400 ppm
+    }
 }
 
 void loop()
 {
-    delay(60000);
+    delay(120000);
 
     if (!mqttClient.connected())
     {
@@ -219,9 +257,17 @@ void loop()
     Serial.print("Temperature (C): ");
     Serial.println(Temp);
 
-    snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\", \"co2\": \"%i\" }", temp, humd, co2);
+    if (co2 > 0) {
+        snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\", \"co2\": \"%i\" }", temp, humd, co2);
+        lastCo2 = co2;
+    } else if (lastCo2 > 0) {
+        snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\", \"co2\": \"%i\" }", temp, humd, lastCo2);
+    } else {
+        snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\" }", temp, humd);
+    }
     Serial.print("Publish message: ");
     Serial.println(msg);
 
     mqttClient.publish(topicNameState, msg);
+    mqttClient.disconnect();
 }
