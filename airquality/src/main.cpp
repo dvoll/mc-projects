@@ -1,20 +1,21 @@
 #include <Arduino.h>
-#include <MHZ19.h>
 #include <ESP8266WiFi.h>
+#include <ArduinoOTA.h>
+#include <MHZ19.h>
 #include <PubSubClient.h>
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <DHT_U.h>
-#include <SoftwareSerial.h> //  Remove if using HardwareSerial or non-uno compatible device
+
+#include <SoftwareSerial.h>
 #include <Config.h>
-#include <SPI.h>
 #include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include "dht_helper.h"
 
-#define DHTPIN 14     // Digital pin connected to the DHT sensor
-#define DHTTYPE DHT22 // DHT 22 (AM2302)
+#define SEALEVELPRESSURE_HPA (1013.25)
 
 #define MH_RX_PIN 12      // Rx pin which the MHZ19 Tx pin is attached to
 #define MH_TX_PIN 13      // Tx pin which the MHZ19 Rx pin is attached to
@@ -22,24 +23,23 @@
 
 #define USER_INPUT_PIN 3
 
-bool configSend = 0;
-DHT_Unified dht(DHTPIN, DHTTYPE);
+unsigned long currentMillis = 0;
+unsigned long loopInterval = 30000;
 
-MHZ19 myMHZ19;                           // Constructor for library
-SoftwareSerial softwareSerialMH(MH_RX_PIN, MH_TX_PIN); // (Uno example) create device to MH-Z19 serial
+unsigned long calibratingDuration = 20 * 60 * 1000;
+unsigned long calibratingMillis = 0;
+bool isCalibrating = false;
+
+MHZ19 myMHZ19;
+SoftwareSerial softwareSerialMH(MH_RX_PIN, MH_TX_PIN);
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 #define MSG_BUFFER_SIZE (204)
 char msg[MSG_BUFFER_SIZE];
 
-// char topicNameTempConfig[] = "homeassistant/sensor/sensorAirQuality2Temp/config";
-// char topicNameHumdConfig[] = "homeassistant/sensor/sensorAirQuality2Humd/config";
-// char topicNameCo2Config[] = "homeassistant/sensor/sensorAirQuality2Co2/config";
-// char topicNameState[] = "homeassistant/sensor/sensorAirQuality2/state";
 char topicNameState[] = "airquality2/state";
-
-unsigned long getDataTimer = 0;
+char topicNameSetCalibration[] = "airquality2/calibr/set";
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
@@ -47,9 +47,13 @@ unsigned long getDataTimer = 0;
 #define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-int lastCo2 = 0;
+Adafruit_BME280 bme; // use I2C interface
+Adafruit_Sensor *bme_temp = bme.getTemperatureSensor();
+Adafruit_Sensor *bme_pressure = bme.getPressureSensor();
+Adafruit_Sensor *bme_humidity = bme.getHumiditySensor();
 
-void setup_wifi()
+
+void setupWifi()
 {
     // WIFI connection
     WiFi.mode(WIFI_STA);
@@ -70,50 +74,29 @@ void setup_wifi()
     Serial.println(WiFi.localIP());
 }
 
-void setup_sensor()
+void callback(char *topic, byte *payload, unsigned int length)
 {
-    // Initialize device.
-    dht.begin();
-    // Print temperature sensor details.
-    sensor_t sensor;
-    dht.temperature().getSensor(&sensor);
-    Serial.println(F("------------------------------------"));
-    Serial.println(F("Temperature Sensor"));
-    Serial.print(F("Sensor Type: "));
-    Serial.println(sensor.name);
-    Serial.print(F("Driver Ver:  "));
-    Serial.println(sensor.version);
-    Serial.print(F("Unique ID:   "));
-    Serial.println(sensor.sensor_id);
-    Serial.print(F("Max Value:   "));
-    Serial.print(sensor.max_value);
-    Serial.println(F("°C"));
-    Serial.print(F("Min Value:   "));
-    Serial.print(sensor.min_value);
-    Serial.println(F("°C"));
-    Serial.print(F("Resolution:  "));
-    Serial.print(sensor.resolution);
-    Serial.println(F("°C"));
-    Serial.println(F("------------------------------------"));
-    // Print humidity sensor details.
-    dht.humidity().getSensor(&sensor);
-    Serial.println(F("Humidity Sensor"));
-    Serial.print(F("Sensor Type: "));
-    Serial.println(sensor.name);
-    Serial.print(F("Driver Ver:  "));
-    Serial.println(sensor.version);
-    Serial.print(F("Unique ID:   "));
-    Serial.println(sensor.sensor_id);
-    Serial.print(F("Max Value:   "));
-    Serial.print(sensor.max_value);
-    Serial.println(F("%"));
-    Serial.print(F("Min Value:   "));
-    Serial.print(sensor.min_value);
-    Serial.println(F("%"));
-    Serial.print(F("Resolution:  "));
-    Serial.print(sensor.resolution);
-    Serial.println(F("%"));
-    Serial.println(F("------------------------------------"));
+    Serial.print("Message arrived [");
+    Serial.print(topic);
+    Serial.print("] ");
+    drawInfo(display, "MSG");
+    for (unsigned int i = 0; i < length; i++)
+    {
+        Serial.print((char)payload[i]);
+    }
+    Serial.println();
+
+    // Switch on the LED if an 1 was received as first character
+    if (strcmp(topic, topicNameSetCalibration) == 0)
+    {
+        if ((char)payload[0] == '1')
+        {
+            isCalibrating = true;
+            calibratingMillis = millis();
+            snprintf(msg, MSG_BUFFER_SIZE, "{ \"calibr\": 1 }");
+            mqttClient.publish(topicNameState, msg);
+        }
+    }
 }
 
 void reconnect()
@@ -131,6 +114,7 @@ void reconnect()
         if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS))
         {
             Serial.println("connected");
+            mqttClient.subscribe(topicNameSetCalibration, 1);
         }
         else
         {
@@ -143,30 +127,6 @@ void reconnect()
     }
 }
 
-// void send_sonsor_config() {
-//     if (!mqttClient.connected())
-//     {
-//         reconnect();
-//     }
-
-//     Serial.println();
-//     Serial.println("Send MQTT homeassistant config...");
-
-//     snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"temperature\", \"name\": \"Temperature\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality2/state\", \"unit_of_meas\": \"°C\", \"val_tpl\": \"{{ value_json.temperature}}\", \"uniq_id\": \"dvairqual02-T\" }");
-//     Serial.println(msg);
-//     mqttClient.publish(topicNameTempConfig, msg);
-
-//     snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"humidity\", \"name\": \"Humidity\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality2/state\", \"unit_of_meas\": \"%%\", \"val_tpl\": \"{{ value_json.humidity}}\", \"uniq_id\": \"dvairqual02-H\" }");
-//     Serial.println(msg);
-//     mqttClient.publish(topicNameHumdConfig, msg);
-
-//     snprintf(msg, MSG_BUFFER_SIZE, "{\"dev_cla\": \"carbon_dioxide\", \"name\": \"CO2\", \"stat_t\": \"homeassistant/sensor/sensorAirQuality2/state\", \"unit_of_meas\": \"ppm\", \"val_tpl\": \"{{ value_json.co2}}\", \"uniq_id\": \"dvairqual02-C\" }");
-//     Serial.println(msg);
-//     mqttClient.publish(topicNameCo2Config, msg);
-
-//     Serial.println();
-//     mqttClient.disconnect();
-// }
 
 void drawTextValues(float temp, float humid, float co2) {
   display.clearDisplay();
@@ -218,115 +178,87 @@ void setup()
     digitalWrite(LED_BUILTIN, HIGH);
 
     softwareSerialMH.begin(BAUDRATE); // (Uno example) device to MH-Z19 serial start
-
     myMHZ19.begin(softwareSerialMH);  // *Serial(Stream) reference must be passed to library begin().
-
-    myMHZ19.autoCalibration(false); // Turn auto calibration ON (OFF autoCalibration(false))
-    Serial.print("ABC Status: "); myMHZ19.getABC() ? Serial.println("ON") :  Serial.println("OFF");
-
-    setup_wifi();
-
-    delay(200);
-
-    mqttClient.setServer(MQTT_SERVER, 1883);
-
-    setup_sensor();
-
-    delay(200);
+    setupCo2(myMHZ19);
 
     setupDisplay();
 
-    delay(400);
+    delay(200);
+
+    drawInfo(display, "...");
+
+    setupWifi();
+    mqttClient.setServer(MQTT_SERVER, 1883);
+    mqttClient.setCallback(callback);
+
+    setupOTA(ArduinoOTA);
+
+    drawInfo(display, "CON");
+
+    if (bme.begin(0x76))
+    {
+      bme_temp->printSensorDetails();
+      bme_humidity->printSensorDetails();
+      bme_pressure->printSensorDetails();
+    } else {
+      Serial.println(F("Could not find a valid BME280 sensor, check wiring!"));
+    }
+
+    delay(200);
 
     if (digitalRead(USER_INPUT_PIN) == LOW) {
-
-        digitalWrite(LED_BUILTIN, LOW);
-        delay(2000);
-        digitalWrite(LED_BUILTIN, HIGH);
-        delay(500);
-        digitalWrite(LED_BUILTIN, LOW);
-        delay(500);
-        digitalWrite(LED_BUILTIN, HIGH);
-
-        Serial.println("Waiting 20 minutes to stabilize...");
-        /* if you don't need to wait (it's already been this amount of time), remove the 2 lines */
-        delay(12e5);    //  20 minutes in milliseconds
-
-        Serial.println("Calibrating..");
-        myMHZ19.calibrate();    // Take a reading which be used as the zero point for 400 ppm
+        calibrateCo2(myMHZ19);
     }
 }
 
 void loop()
 {
+    // check for WiFi OTA updates
+    ArduinoOTA.handle();
+
     if (!mqttClient.connected())
     {
         reconnect();
     }
+    mqttClient.loop();
 
-    float temp = 0.0;
-    float tempCorrected = 0.0;
-    float humd = 0.0;
-    float humdCorrected = 0.0;
-    int co2 = 0;
+    if (isCalibrating && millis() - calibratingMillis >= calibratingDuration) {
+        calibrateCo2(myMHZ19);
 
-    // Get temperature event and print its value.
-    sensors_event_t event;
+        drawInfo(display, "DO NE");
+        isCalibrating = false;
+        calibratingMillis = 0;
 
-    dht.temperature().getEvent(&event);
-    if (isnan(event.temperature))
+    } else if (isCalibrating)
     {
-        Serial.println(F("Error reading temperature!"));
+        drawInfo(display, "CAL");
+        snprintf(msg, MSG_BUFFER_SIZE, "{ \"calibr\": 1 }");
     }
-    else
+    else if (millis() - currentMillis >= loopInterval)
     {
-        temp = event.temperature;
-        tempCorrected = temp - 1.5;
-        Serial.print(F("Temperature: "));
-        Serial.print(tempCorrected);
-        Serial.println(F("°C"));
+    
+        std::tuple<float, float, float> tempHumPres = bmeReadSensorValues(bme_temp, bme_humidity, bme_pressure);
+
+        int co2 = 0;
+        if (currentMillis > 0) // Skip first iteration of loop to wait for sensor to stabilize
+        {
+            co2 = getCo2(myMHZ19);
+        }
+
+        if (co2 > 0) {
+            snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\", \"co2\": \"%i\", \"calibr\": 0}", std::get<0>(tempHumPres), std::get<1>(tempHumPres), co2);
+        } else {
+            snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\", \"calibr\": 0}", std::get<0>(tempHumPres), std::get<1>(tempHumPres));
+        }
+
+        drawTextValues(std::get<0>(tempHumPres), std::get<1>(tempHumPres), co2);
+
+        Serial.print("Publish message: ");
+        Serial.println(msg);
+
+        mqttClient.publish(topicNameState, msg);
+
+        currentMillis = millis();
+        // mqttClient.disconnect();
     }
-
-    dht.humidity().getEvent(&event);
-    if (isnan(event.relative_humidity))
-    {
-        Serial.println(F("Error reading humidity!"));
-    }
-    else
-    {
-        humd = event.relative_humidity;
-        humdCorrected = humd + 1.5;
-        Serial.print(F("Humidity: "));
-        Serial.print(humdCorrected);
-        Serial.println(F("%"));
-    }
-
-    co2 = myMHZ19.getCO2(); // Request CO2 (as ppm)
-
-    Serial.print("CO2 (ppm): ");
-    Serial.println(co2);
-
-    int8_t Temp;
-    Temp = myMHZ19.getTemperature(); // Request Temperature (as Celsius)
-    Serial.print("Temperature (C): ");
-    Serial.println(Temp);
-
-    if (co2 > 0) {
-        snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\", \"co2\": \"%i\" }", tempCorrected, humdCorrected, co2);
-        lastCo2 = co2;
-    } else if (lastCo2 > 0) {
-        snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\", \"co2\": \"%i\" }", tempCorrected, humdCorrected, lastCo2);
-    } else {
-        snprintf(msg, MSG_BUFFER_SIZE, "{ \"temperature\": \"%.2f\", \"humidity\": \"%.2f\" }", tempCorrected, humd);
-    }
-
-    drawTextValues(tempCorrected, humdCorrected, co2);
-
-    Serial.print("Publish message: ");
-    Serial.println(msg);
-
-    mqttClient.publish(topicNameState, msg);
-    mqttClient.disconnect();
-
-    delay(120000);
 }
